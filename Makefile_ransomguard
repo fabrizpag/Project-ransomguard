@@ -1,0 +1,94 @@
+# =============================================================================
+# RansomGuard Makefile
+# =============================================================================
+
+# --- Toolchain ---
+CLANG       ?= clang
+CC          ?= gcc
+BPFTOOL     ?= bpftool
+
+# --- Target Architecture ---
+ARCH        := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+
+# --- Include paths ---
+# Adatta questi percorsi alla tua installazione di libbpf
+LIBBPF_INC  ?= /usr/include/bpf
+KERNEL_INC  ?= /usr/include
+BPF_INC     ?= /usr/include
+
+INCLUDES    := -I$(LIBBPF_INC) -I$(KERNEL_INC) -I$(BPF_INC) -I.
+
+# --- Flags ---
+BPF_CFLAGS  := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) $(INCLUDES) \
+               -Wall -Wno-unused-value -Wno-pointer-sign \
+               -Wno-compare-distinct-pointer-types
+USER_CFLAGS := -g -O2 -Wall $(INCLUDES)
+LDFLAGS     := -lbpf -lelf -lz
+
+# --- Files ---
+BPF_SRC     := ransomguard.bpf.c
+BPF_OBJ     := ransomguard.bpf.o
+SKEL_HDR    := ransomguard.skel.h
+USER_SRC    := ransomguard.c
+TARGET      := ransomguard
+
+# vmlinux.h: genera dal kernel in esecuzione se non presente
+VMLINUX_H   := vmlinux.h
+
+.PHONY: all clean vmlinux help
+
+# --- Default target ---
+all: $(TARGET)
+
+# --- Genera vmlinux.h dal kernel in esecuzione ---
+$(VMLINUX_H):
+	@echo "[GEN] Generazione vmlinux.h dal kernel in esecuzione..."
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX_H)
+	@echo "[OK ] vmlinux.h generato"
+
+# --- Compila il programma BPF ---
+$(BPF_OBJ): $(BPF_SRC) $(VMLINUX_H)
+	@echo "[BPF] Compilazione $< ..."
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+	@echo "[OK ] $@ generato"
+
+# --- Genera lo skeleton header ---
+$(SKEL_HDR): $(BPF_OBJ)
+	@echo "[GEN] Generazione skeleton header $@ ..."
+	$(BPFTOOL) gen skeleton $< > $@
+	@echo "[OK ] $@ generato"
+
+# --- Compila il programma user-space ---
+$(TARGET): $(USER_SRC) $(SKEL_HDR)
+	@echo "[CC ] Compilazione $< ..."
+	$(CC) $(USER_CFLAGS) $< -o $@ $(LDFLAGS)
+	@echo "[OK ] Binario $@ pronto"
+
+# --- Genera solo vmlinux.h ---
+vmlinux: $(VMLINUX_H)
+
+# --- Pulizia ---
+clean:
+	@echo "[CLN] Pulizia..."
+	rm -f $(BPF_OBJ) $(SKEL_HDR) $(TARGET) ransomguard.log
+	@echo "[OK ] Pulizia completata"
+
+# --- Help ---
+help:
+	@echo "RansomGuard - Anti-Ransomware eBPF per Linux"
+	@echo ""
+	@echo "Target disponibili:"
+	@echo "  make           - Compila tutto (vmlinux.h + BPF + userspace)"
+	@echo "  make vmlinux   - Genera solo vmlinux.h"
+	@echo "  make clean     - Rimuove tutti i file generati"
+	@echo "  make help      - Mostra questo messaggio"
+	@echo ""
+	@echo "Uso del programma:"
+	@echo "  sudo ./ransomguard"
+	@echo "  sudo ./ransomguard --config mia_config.yaml"
+	@echo "  sudo ./ransomguard --verbose --pid 1234"
+	@echo ""
+	@echo "Requisiti:"
+	@echo "  - Linux kernel >= 5.13 (per bpf_send_signal e ring buffer)"
+	@echo "  - libbpf-dev, clang, bpftool"
+	@echo "  - Kernel compilato con CONFIG_DEBUG_INFO_BTF=y"

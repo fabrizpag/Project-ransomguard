@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: GPL-2.0
+// RansomGuard - eBPF Anti-Ransomware Monitor
+// Kernel-side program: intercetta open, write, rename, unlink,
+// getrandom, socket(AF_ALG), sendmsg, copy_file_range, vmsplice
+
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+// ---------------------------------------------------------------------------
+// Costanti
+// ---------------------------------------------------------------------------
+#define MAX_PIDS          256
+#define MAX_EVENTS        4096
+#define MAX_PROC_STATS    1024
+#define MAX_PATH_LEN      128
+#define AF_ALG            38
+#define WINDOW_NS         10000000000ULL   // 10 secondi in nanosecondi
+
+// Tipi di evento (usati come "syscallType" nelle mappe)
+#define EV_OPEN           1
+#define EV_WRITE          2
+#define EV_RENAME         3
+#define EV_UNLINK         4
+#define EV_GETRANDOM      5
+#define EV_SOCKET_AFLG    6   // socket(AF_ALG,...)
+#define EV_SENDMSG        7
+#define EV_COPY_FILE_RANGE 8
+#define EV_VMSPLICE       9
+
+// Flags per open() sospetti
+#define O_WRONLY  00000001
+#define O_RDWR    00000002
+#define O_CREAT   00000100
+#define O_TRUNC   00001000
+
+// ---------------------------------------------------------------------------
+// Strutture condivise user-space / kernel
+// ---------------------------------------------------------------------------
+
+// Un singolo evento raccolto dall'eBPF
+typedef struct {
+    unsigned long long timestamp_ns;   // bpf_ktime_get_ns()
+    unsigned int       pid;
+    unsigned int       tgid;
+    unsigned int       event_type;     // EV_*
+    unsigned int       flags;          // open flags, socket domain, ecc.
+    char               comm[16];       // nome processo
+    char               path[MAX_PATH_LEN]; // path file (se disponibile)
+} event_t;
+
+// Statistiche per-processo: usate per il sistema di scoring
+typedef struct {
+    unsigned int  pid;
+    unsigned int  tgid;
+    char          comm[16];
+    unsigned long long window_start_ns;  // inizio finestra temporale corrente
+    unsigned int  open_count;
+    unsigned int  write_count;
+    unsigned int  rename_count;
+    unsigned int  unlink_count;
+    unsigned int  getrandom_count;
+    unsigned int  socket_aflg_count;
+    unsigned int  sendmsg_count;
+    unsigned int  copy_file_range_count;
+    unsigned int  vmsplice_count;
+    unsigned int  score;                 // punteggio pericolosità [0..100]
+    unsigned int  killed;                // 1 se il processo è già stato segnalato
+} proc_stat_t;
+
+// Per il ring buffer degli eventi verso user-space
+// (usiamo BPF_MAP_TYPE_RINGBUF per efficienza)
+
+// ---------------------------------------------------------------------------
+// BPF Maps
+// ---------------------------------------------------------------------------
+
+// Ring buffer: eventi da kernel → user-space (più efficiente di perf_event)
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);  // 16 MB
+} events_ringbuf SEC(".maps");
+
+// Mappa hash: pid → proc_stat_t  (statistiche e scoring per processo)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, unsigned int);          // pid
+    __type(value, proc_stat_t);
+    __uint(max_entries, MAX_PROC_STATS);
+} proc_stats_map SEC(".maps");
+
+// Mappa array: configurazione soglie (scritta da user-space al setup)
+// [0] = soglia open/finestra
+// [1] = soglia write/finestra
+// [2] = soglia rename/finestra
+// [3] = soglia unlink/finestra
+// [4] = soglia score massimo prima di segnalare
+// [5] = finestra temporale in secondi
+// [6] = kill_on_detect: 1 = manda SIGKILL via bpf_send_signal
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, unsigned int);
+    __type(value, unsigned int);
+    __uint(max_entries, 16);
+} config_map SEC(".maps");
+
+// Mappa array: whitelist PID (processi da NON monitorare, es. antivirus stesso)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, unsigned int);
+    __type(value, unsigned int);        // pid nella whitelist
+    __uint(max_entries, MAX_PIDS);
+} whitelist_map SEC(".maps");
+
+// Mappa per tenere traccia dei pid aperti per AF_ALG socket
+// pid → fd del socket AF_ALG (per correlazione bind/accept/setsockopt)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, unsigned int);
+    __type(value, unsigned int);
+    __uint(max_entries, 512);
+} aflg_socket_map SEC(".maps");
+
+// ---------------------------------------------------------------------------
+// Funzioni helper inline
+// ---------------------------------------------------------------------------
+
+// Controlla se il pid è in whitelist; ritorna 1 se whitelist
+static __always_inline int is_whitelisted(unsigned int pid) {
+    for (int i = 0; i < 64; i++) {
+        unsigned int key = i;
+        unsigned int *wpid = bpf_map_lookup_elem(&whitelist_map, &key);
+        if (wpid == NULL || *wpid == 0)
+            break;
+        if (*wpid == pid)
+            return 1;
+    }
+    return 0;
+}
+
+// Legge una soglia dalla config_map
+static __always_inline unsigned int get_threshold(unsigned int idx) {
+    unsigned int *v = bpf_map_lookup_elem(&config_map, &idx);
+    if (v == NULL) return 0;
+    return *v;
+}
+
+// Aggiorna lo score del processo in base alle sue statistiche.
+// Schema di scoring:
+//   - Ogni unlink   = +3 punti  (altamente sospetto)
+//   - Ogni rename   = +2 punti  (rinominare .jpg → .enc è tipico)
+//   - Ogni write    = +1 punto  (pesato meno, normale)
+//   - socket AF_ALG = +10 punti (uso della crypto API del kernel)
+//   - getrandom     = +5 punti  (generazione chiavi)
+//   - sendmsg       = +3 punti  (invio dati cifrati)
+//   - copy_file_range/vmsplice = +4 punti ciascuno (zero-copy sospetto)
+// Il punteggio è clamped a 100.
+static __always_inline void update_score(proc_stat_t *ps) {
+    unsigned int s = 0;
+    unsigned int thr_open   = get_threshold(0);
+    unsigned int thr_write  = get_threshold(1);
+    unsigned int thr_rename = get_threshold(2);
+    unsigned int thr_unlink = get_threshold(3);
+
+    // superamento soglie per finestra temporale
+    if (thr_open   > 0 && ps->open_count   > thr_open)   s += 5;
+    if (thr_write  > 0 && ps->write_count  > thr_write)  s += 5;
+    if (thr_rename > 0 && ps->rename_count > thr_rename) s += 15;
+    if (thr_unlink > 0 && ps->unlink_count > thr_unlink) s += 20;
+
+    // contributo assoluto delle syscall crittorafiche / distruttive
+    if (ps->socket_aflg_count > 0)      s += ps->socket_aflg_count * 10;
+    if (ps->getrandom_count > 2)        s += ps->getrandom_count  * 5;
+    if (ps->sendmsg_count > 0)          s += ps->sendmsg_count    * 3;
+    if (ps->copy_file_range_count > 0)  s += ps->copy_file_range_count * 4;
+    if (ps->vmsplice_count > 0)         s += ps->vmsplice_count   * 4;
+    if (ps->unlink_count > 0)           s += ps->unlink_count     * 3;
+    if (ps->rename_count > 0)           s += ps->rename_count     * 2;
+    if (ps->write_count > 5)            s += (ps->write_count - 5) * 1;
+
+    // clamp a 100
+    ps->score = s > 100 ? 100 : s;
+}
+
+// Ottieni o crea la struct proc_stat per il processo corrente
+static __always_inline proc_stat_t *get_or_create_proc_stat(unsigned int pid,
+                                                              unsigned int tgid,
+                                                              const char *comm) {
+    proc_stat_t *ps = bpf_map_lookup_elem(&proc_stats_map, &pid);
+    if (ps == NULL) {
+        proc_stat_t new_ps = {};
+        new_ps.pid  = pid;
+        new_ps.tgid = tgid;
+        new_ps.window_start_ns = bpf_ktime_get_ns();
+        // copia comm (max 16 byte)
+        for (int i = 0; i < 16; i++)
+            new_ps.comm[i] = comm[i];
+        bpf_map_update_elem(&proc_stats_map, &pid, &new_ps, BPF_ANY);
+        ps = bpf_map_lookup_elem(&proc_stats_map, &pid);
+    }
+    return ps;
+}
+
+// Resetta i contatori della finestra se è scaduta
+static __always_inline void maybe_reset_window(proc_stat_t *ps) {
+    unsigned long long now = bpf_ktime_get_ns();
+    unsigned int win_sec = get_threshold(5);
+    unsigned long long win_ns = win_sec > 0 ? (unsigned long long)win_sec * 1000000000ULL : WINDOW_NS;
+    if ((now - ps->window_start_ns) > win_ns) {
+        ps->window_start_ns      = now;
+        ps->open_count           = 0;
+        ps->write_count          = 0;
+        ps->rename_count         = 0;
+        ps->unlink_count         = 0;
+        ps->getrandom_count      = 0;
+        ps->socket_aflg_count    = 0;
+        ps->sendmsg_count        = 0;
+        ps->copy_file_range_count = 0;
+        ps->vmsplice_count       = 0;
+        ps->score                = 0;
+    }
+}
+
+// Emette un evento sul ring buffer verso user-space
+static __always_inline void emit_event(unsigned int pid, unsigned int tgid,
+                                        unsigned int ev_type, unsigned int flags,
+                                        const char *comm, const char *path) {
+    event_t *e = bpf_ringbuf_reserve(&events_ringbuf, sizeof(event_t), 0);
+    if (!e) return;
+
+    e->timestamp_ns = bpf_ktime_get_ns();
+    e->pid          = pid;
+    e->tgid         = tgid;
+    e->event_type   = ev_type;
+    e->flags        = flags;
+
+    for (int i = 0; i < 16; i++)
+        e->comm[i] = comm[i];
+
+    if (path) {
+        bpf_probe_read_user_str(e->path, MAX_PATH_LEN, path);
+    } else {
+        e->path[0] = '\0';
+    }
+
+    bpf_ringbuf_submit(e, 0);
+}
+
+// Controlla lo score e invia SIGKILL se configurato
+static __always_inline void check_and_kill(proc_stat_t *ps) {
+    if (ps->killed) return;
+    unsigned int thr_score    = get_threshold(4);
+    unsigned int kill_enabled = get_threshold(6);
+    if (thr_score > 0 && ps->score >= thr_score) {
+        ps->killed = 1;
+        if (kill_enabled) {
+            bpf_send_signal(9); // SIGKILL al processo corrente
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_openat
+// Intercetta open/openat (apertura file)
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_openat")
+int handle_enter_openat(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    // args: int dfd, const char __user *filename, int flags, umode_t mode
+    const char *filename = (const char *)ctx->args[1];
+    unsigned int flags   = (unsigned int)ctx->args[2];
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->open_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_OPEN, flags, comm, filename);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_write
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_write")
+int handle_enter_write(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->write_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_WRITE, 0, comm, NULL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_rename / sys_enter_renameat2
+// Tipico pattern ransomware: foto.jpg → foto.jpg.enc
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_rename")
+int handle_enter_rename(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    const char *oldname = (const char *)ctx->args[0];
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->rename_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_RENAME, 0, comm, oldname);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_enter_renameat2")
+int handle_enter_renameat2(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    // args: olddirfd, oldpath, newdirfd, newpath, flags
+    const char *oldname = (const char *)ctx->args[1];
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->rename_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_RENAME, 0, comm, oldname);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_unlink / sys_enter_unlinkat
+// Pattern distruttivo: elimina file originali dopo cifratura
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_unlink")
+int handle_enter_unlink(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    const char *pathname = (const char *)ctx->args[0];
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->unlink_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_UNLINK, 0, comm, pathname);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_enter_unlinkat")
+int handle_enter_unlinkat(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    const char *pathname = (const char *)ctx->args[1];
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->unlink_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_UNLINK, 0, comm, pathname);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_getrandom
+// Fondamentale per la generazione di chiavi crittografiche
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_getrandom")
+int handle_enter_getrandom(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->getrandom_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_GETRANDOM, 0, comm, NULL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_socket
+// Intercetta socket(AF_ALG, ...) → uso della Crypto API del kernel
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_socket")
+int handle_enter_socket(struct trace_event_raw_sys_enter *ctx)
+{
+    // args[0] = domain (AF_ALG == 38)
+    int domain = (int)ctx->args[0];
+    if (domain != AF_ALG) return 0;
+
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->socket_aflg_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_SOCKET_AFLG, (unsigned int)domain, comm, NULL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_sendmsg
+// Invio di dati "in chiaro" al socket AF_ALG per cifratura
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_sendmsg")
+int handle_enter_sendmsg(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    // Controlla se questo processo ha già aperto un socket AF_ALG
+    unsigned int *aflg_fd = bpf_map_lookup_elem(&aflg_socket_map, &pid);
+    if (!aflg_fd) return 0;  // non interessa se non ha aperto AF_ALG
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->sendmsg_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_SENDMSG, 0, comm, NULL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_exit_socket
+// Registra il fd del socket AF_ALG appena creato
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_exit_socket")
+int handle_exit_socket(struct trace_event_raw_sys_exit *ctx)
+{
+    long ret = ctx->ret;
+    if (ret < 0) return 0;
+
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+
+    // Salvare il fd restituito: non sappiamo qui il domain, 
+    // ma se socket_aflg_count > 0 per questo pid, è AF_ALG
+    proc_stat_t *ps = bpf_map_lookup_elem(&proc_stats_map, &pid);
+    if (ps && ps->socket_aflg_count > 0) {
+        unsigned int fd = (unsigned int)ret;
+        bpf_map_update_elem(&aflg_socket_map, &pid, &fd, BPF_ANY);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_copy_file_range
+// Zero-copy tra file, usato dai ransomware moderni
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_copy_file_range")
+int handle_enter_copy_file_range(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->copy_file_range_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_COPY_FILE_RANGE, 0, comm, NULL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint: sys_enter_vmsplice
+// Sposta dati tra pipe e memoria senza copie, amato dai ransomware
+// ---------------------------------------------------------------------------
+SEC("tp/syscalls/sys_enter_vmsplice")
+int handle_enter_vmsplice(struct trace_event_raw_sys_enter *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid  = (unsigned int)(pid_tgid & 0xFFFFFFFF);
+    unsigned int tgid = (unsigned int)(pid_tgid >> 32);
+
+    if (is_whitelisted(pid)) return 0;
+
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    proc_stat_t *ps = get_or_create_proc_stat(pid, tgid, comm);
+    if (!ps) return 0;
+
+    maybe_reset_window(ps);
+    ps->vmsplice_count++;
+    update_score(ps);
+    check_and_kill(ps);
+
+    emit_event(pid, tgid, EV_VMSPLICE, 0, comm, NULL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+char LICENSE[] SEC("license") = "GPL";

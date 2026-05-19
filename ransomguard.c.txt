@@ -1,0 +1,544 @@
+/*
+ * RansomGuard - User-Space Monitor
+ * Legge eventi dal ring buffer eBPF, applica scoring,
+ * logga e reagisce in tempo reale agli attacchi ransomware.
+ *
+ * Compilazione:
+ *   make
+ *
+ * Uso:
+ *   sudo ./ransomguard [--config ransomguard_config.yaml] [--pid <pid>] [--verbose]
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#include "ransomguard.skel.h"
+
+// ---------------------------------------------------------------------------
+// Costanti (specchiano ransomguard.bpf.c)
+// ---------------------------------------------------------------------------
+#define MAX_PATH_LEN      128
+#define MAX_PROC_STATS    1024
+#define MAX_PIDS          256
+
+#define EV_OPEN            1
+#define EV_WRITE           2
+#define EV_RENAME          3
+#define EV_UNLINK          4
+#define EV_GETRANDOM       5
+#define EV_SOCKET_AFLG     6
+#define EV_SENDMSG         7
+#define EV_COPY_FILE_RANGE 8
+#define EV_VMSPLICE        9
+
+// Indici config_map
+#define CFG_THR_OPEN     0
+#define CFG_THR_WRITE    1
+#define CFG_THR_RENAME   2
+#define CFG_THR_UNLINK   3
+#define CFG_THR_SCORE    4
+#define CFG_WIN_SEC      5
+#define CFG_KILL_ENABLE  6
+
+// ---------------------------------------------------------------------------
+// Strutture (specchiano il BPF)
+// ---------------------------------------------------------------------------
+typedef struct {
+    unsigned long long timestamp_ns;
+    unsigned int       pid;
+    unsigned int       tgid;
+    unsigned int       event_type;
+    unsigned int       flags;
+    char               comm[16];
+    char               path[MAX_PATH_LEN];
+} event_t;
+
+typedef struct {
+    unsigned int  pid;
+    unsigned int  tgid;
+    char          comm[16];
+    unsigned long long window_start_ns;
+    unsigned int  open_count;
+    unsigned int  write_count;
+    unsigned int  rename_count;
+    unsigned int  unlink_count;
+    unsigned int  getrandom_count;
+    unsigned int  socket_aflg_count;
+    unsigned int  sendmsg_count;
+    unsigned int  copy_file_range_count;
+    unsigned int  vmsplice_count;
+    unsigned int  score;
+    unsigned int  killed;
+} proc_stat_t;
+
+// ---------------------------------------------------------------------------
+// Configurazione (letta da YAML semplificato o valori di default)
+// ---------------------------------------------------------------------------
+typedef struct {
+    // Soglie per finestra temporale
+    unsigned int thr_open;      // default: 200
+    unsigned int thr_write;     // default: 200
+    unsigned int thr_rename;    // default: 10
+    unsigned int thr_unlink;    // default: 20
+    unsigned int thr_score;     // default: 60  (su 100)
+    unsigned int window_sec;    // default: 10
+    bool         kill_on_detect; // default: false (sicurezza: off di default)
+    bool         verbose;        // stampa ogni evento
+    char         log_file[256]; // default: "ransomguard.log"
+    // Whitelist
+    char         whitelist_comm[32][32]; // nomi processo in whitelist
+    int          whitelist_comm_count;
+    unsigned int whitelist_pid[MAX_PIDS];
+    int          whitelist_pid_count;
+} rg_config_t;
+
+// ---------------------------------------------------------------------------
+// Stato globale
+// ---------------------------------------------------------------------------
+static rg_config_t  g_cfg;
+static FILE        *g_logfile = NULL;
+static volatile    bool g_running = true;
+static struct ransomguard *g_skel = NULL;
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+static void rg_log(const char *level, const char *fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    // timestamp human-readable
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    // stdout
+    printf("[%s] [%s] %s\n", ts, level, buf);
+    fflush(stdout);
+
+    // file di log
+    if (g_logfile) {
+        fprintf(g_logfile, "[%s] [%s] %s\n", ts, level, buf);
+        fflush(g_logfile);
+    }
+}
+
+#define LOG_INFO(...)  rg_log("INFO ", __VA_ARGS__)
+#define LOG_WARN(...)  rg_log("WARN ", __VA_ARGS__)
+#define LOG_ALERT(...) rg_log("ALERT", __VA_ARGS__)
+#define LOG_DEBUG(...) do { if (g_cfg.verbose) rg_log("DEBUG", __VA_ARGS__); } while(0)
+
+// ---------------------------------------------------------------------------
+// Parser YAML minimale
+// Supporta solo chiavi semplici: chiave: valore (una per riga)
+// Ignora commenti (#) e whitespace.
+// ---------------------------------------------------------------------------
+static void set_defaults(rg_config_t *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->thr_open      = 200;
+    cfg->thr_write     = 200;
+    cfg->thr_rename    = 10;
+    cfg->thr_unlink    = 20;
+    cfg->thr_score     = 60;
+    cfg->window_sec    = 10;
+    cfg->kill_on_detect = false;
+    cfg->verbose       = false;
+    strncpy(cfg->log_file, "ransomguard.log", sizeof(cfg->log_file) - 1);
+}
+
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+        *end-- = '\0';
+    return s;
+}
+
+static bool parse_yaml(const char *path, rg_config_t *cfg) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "Impossibile aprire il file di configurazione: %s\n", path);
+        return false;
+    }
+
+    char line[512];
+    char section[64] = "";
+
+    while (fgets(line, sizeof(line), f)) {
+        char *l = trim(line);
+        if (*l == '#' || *l == '\0') continue;
+
+        // Rilevazione sezione YAML (es. "thresholds:")
+        if (l[strlen(l)-1] == ':' && strchr(l, ' ') == NULL) {
+            strncpy(section, l, sizeof(section)-1);
+            section[strlen(section)-1] = '\0'; // rimuovi ':'
+            continue;
+        }
+
+        // Parsing chiave: valore
+        char *colon = strchr(l, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        char *key = trim(l);
+        char *val = trim(colon + 1);
+
+        // Thresholds
+        if (strcmp(key, "open_per_window")   == 0) cfg->thr_open   = atoi(val);
+        if (strcmp(key, "write_per_window")  == 0) cfg->thr_write  = atoi(val);
+        if (strcmp(key, "rename_per_window") == 0) cfg->thr_rename = atoi(val);
+        if (strcmp(key, "unlink_per_window") == 0) cfg->thr_unlink = atoi(val);
+        if (strcmp(key, "score_alert")       == 0) cfg->thr_score  = atoi(val);
+        if (strcmp(key, "window_seconds")    == 0) cfg->window_sec = atoi(val);
+
+        // Azioni
+        if (strcmp(key, "kill_on_detect")    == 0)
+            cfg->kill_on_detect = (strcmp(val,"true")==0 || strcmp(val,"yes")==0);
+        if (strcmp(key, "verbose")           == 0)
+            cfg->verbose = (strcmp(val,"true")==0 || strcmp(val,"yes")==0);
+        if (strcmp(key, "log_file")          == 0)
+            strncpy(cfg->log_file, val, sizeof(cfg->log_file)-1);
+
+        // Whitelist per nome processo (es.  "- gzip")
+        if (strncmp(key, "- ", 2) == 0 && strcmp(section, "whitelist_processes") == 0) {
+            if (cfg->whitelist_comm_count < 32) {
+                strncpy(cfg->whitelist_comm[cfg->whitelist_comm_count++],
+                        key + 2, 31);
+            }
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Bump memlock (come nel tuo simple.c)
+// ---------------------------------------------------------------------------
+static void bump_memlock_rlimit(void) {
+    struct rlimit rlim_new = {
+        .rlim_cur = RLIM_INFINITY,
+        .rlim_max = RLIM_INFINITY,
+    };
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim_new)) {
+        fprintf(stderr, "Errore setrlimit RLIMIT_MEMLOCK: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Carica la configurazione nelle BPF maps
+// ---------------------------------------------------------------------------
+static void push_config_to_bpf(struct ransomguard *skel, const rg_config_t *cfg) {
+    int config_fd = bpf_map__fd(skel->maps.config_map);
+
+    unsigned int vals[7] = {
+        cfg->thr_open,
+        cfg->thr_write,
+        cfg->thr_rename,
+        cfg->thr_unlink,
+        cfg->thr_score,
+        cfg->window_sec,
+        cfg->kill_on_detect ? 1 : 0
+    };
+
+    for (unsigned int i = 0; i < 7; i++) {
+        if (bpf_map_update_elem(config_fd, &i, &vals[i], BPF_ANY) != 0) {
+            fprintf(stderr, "Errore aggiornamento config_map[%u]: %s\n", i, strerror(errno));
+        }
+    }
+    LOG_INFO("Configurazione caricata nel BPF: open=%u write=%u rename=%u unlink=%u "
+             "score=%u window=%us kill=%s",
+             vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
+             vals[6] ? "SI" : "NO");
+}
+
+// Aggiunge i processi in whitelist alla BPF map
+static void push_whitelist_to_bpf(struct ransomguard *skel, const rg_config_t *cfg) {
+    int wl_fd = bpf_map__fd(skel->maps.whitelist_map);
+    // PID espliciti
+    for (int i = 0; i < cfg->whitelist_pid_count; i++) {
+        unsigned int key = (unsigned int)i;
+        bpf_map_update_elem(wl_fd, &key, &cfg->whitelist_pid[i], BPF_ANY);
+    }
+    // Aggiunge il PID del processo corrente (l'antivirus stesso)
+    unsigned int my_pid = (unsigned int)getpid();
+    unsigned int key = (unsigned int)cfg->whitelist_pid_count;
+    bpf_map_update_elem(wl_fd, &key, &my_pid, BPF_ANY);
+    LOG_INFO("Whitelist: %d PID espliciti + PID self (%u)", cfg->whitelist_pid_count, my_pid);
+}
+
+// ---------------------------------------------------------------------------
+// Nome leggibile per il tipo di evento
+// ---------------------------------------------------------------------------
+static const char *ev_name(unsigned int ev) {
+    switch (ev) {
+        case EV_OPEN:            return "open";
+        case EV_WRITE:           return "write";
+        case EV_RENAME:          return "rename";
+        case EV_UNLINK:          return "unlink";
+        case EV_GETRANDOM:       return "getrandom";
+        case EV_SOCKET_AFLG:     return "socket(AF_ALG)";
+        case EV_SENDMSG:         return "sendmsg[AF_ALG]";
+        case EV_COPY_FILE_RANGE: return "copy_file_range";
+        case EV_VMSPLICE:        return "vmsplice";
+        default:                 return "unknown";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Callback del ring buffer: gestisce ogni evento ricevuto dal kernel
+// ---------------------------------------------------------------------------
+static int handle_event(void *ctx, void *data, size_t data_sz) {
+    if (data_sz < sizeof(event_t)) return 0;
+    const event_t *e = (const event_t *)data;
+
+    // Log verboso dell'evento raw
+    LOG_DEBUG("EVT pid=%-6u comm=%-16s type=%-20s path=%s",
+              e->pid, e->comm, ev_name(e->event_type), e->path);
+
+    // Legge le statistiche aggiornate dal BPF per questo processo
+    int stats_fd = bpf_map__fd(g_skel->maps.proc_stats_map);
+    proc_stat_t ps;
+    if (bpf_map_lookup_elem(stats_fd, &e->pid, &ps) != 0)
+        return 0;
+
+    // Controllo soglie e allerta
+    bool alert = false;
+    char reason[512] = "";
+
+    if (ps.score >= g_cfg.thr_score) {
+        snprintf(reason, sizeof(reason),
+                 "SCORE=%u/100 | open=%u write=%u rename=%u unlink=%u "
+                 "getrandom=%u AF_ALG=%u sendmsg=%u cfr=%u vmsplice=%u",
+                 ps.score,
+                 ps.open_count, ps.write_count, ps.rename_count, ps.unlink_count,
+                 ps.getrandom_count, ps.socket_aflg_count, ps.sendmsg_count,
+                 ps.copy_file_range_count, ps.vmsplice_count);
+        alert = true;
+    }
+
+    // Allerta specifica per pattern ransomware classico:
+    // unlink elevato + rename + (getrandom o AF_ALG)
+    if (!alert &&
+        ps.unlink_count  >= g_cfg.thr_unlink &&
+        ps.rename_count  >= (g_cfg.thr_rename / 2) &&
+        (ps.getrandom_count > 0 || ps.socket_aflg_count > 0)) {
+        snprintf(reason, sizeof(reason),
+                 "PATTERN RANSOMWARE: unlink=%u rename=%u getrandom=%u AF_ALG=%u",
+                 ps.unlink_count, ps.rename_count,
+                 ps.getrandom_count, ps.socket_aflg_count);
+        alert = true;
+    }
+
+    if (alert && !ps.killed) {
+        LOG_ALERT("*** RANSOMWARE RILEVATO *** PID=%u COMM=%s %s",
+                  e->pid, e->comm, reason);
+
+        // Se kill_on_detect è abilitato nella config, il BPF ha già
+        // inviato SIGKILL via bpf_send_signal(). Lo logghiamo.
+        if (g_cfg.kill_on_detect) {
+            LOG_ALERT("SIGKILL inviato a PID=%u (%s) tramite eBPF", e->pid, e->comm);
+        } else {
+            // In modalità solo rilevazione: invia SIGSTOP per bloccare
+            // il processo senza ucciderlo, dando tempo all'operatore
+            LOG_WARN("Invio SIGSTOP a PID=%u (%s) (kill_on_detect=false)",
+                     e->pid, e->comm);
+            kill((pid_t)e->pid, SIGSTOP);
+        }
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Dump periodico delle statistiche (ogni 30s)
+// ---------------------------------------------------------------------------
+static void dump_stats(struct ransomguard *skel) {
+    int stats_fd = bpf_map__fd(skel->maps.proc_stats_map);
+    unsigned int key = 0, next_key;
+    proc_stat_t ps;
+    int count = 0;
+
+    LOG_INFO("=== DUMP STATISTICHE PROCESSI ===");
+    while (bpf_map_get_next_key(stats_fd, &key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(stats_fd, &next_key, &ps) == 0 && ps.pid != 0) {
+            if (ps.score > 0) {
+                LOG_INFO("  PID=%-6u COMM=%-16s score=%3u open=%u write=%u "
+                         "rename=%u unlink=%u getrandom=%u AF_ALG=%u",
+                         ps.pid, ps.comm, ps.score,
+                         ps.open_count, ps.write_count,
+                         ps.rename_count, ps.unlink_count,
+                         ps.getrandom_count, ps.socket_aflg_count);
+                count++;
+            }
+        }
+        key = next_key;
+    }
+    if (count == 0) LOG_INFO("  (nessun processo con score > 0)");
+    LOG_INFO("=================================");
+}
+
+// ---------------------------------------------------------------------------
+// Gestione segnali (SIGINT / SIGTERM)
+// ---------------------------------------------------------------------------
+static void sig_handler(int signo) {
+    (void)signo;
+    g_running = false;
+}
+
+// ---------------------------------------------------------------------------
+// Stampa aiuto
+// ---------------------------------------------------------------------------
+static void print_usage(const char *prog) {
+    printf("Uso: sudo %s [opzioni]\n\n", prog);
+    printf("Opzioni:\n");
+    printf("  --config <file.yaml>   File di configurazione (default: ransomguard_config.yaml)\n");
+    printf("  --pid    <pid>         Aggiunge un PID alla whitelist\n");
+    printf("  --verbose              Stampa ogni evento ricevuto\n");
+    printf("  --help                 Mostra questo messaggio\n");
+    printf("\nEsempio:\n");
+    printf("  sudo %s --config ransomguard_config.yaml --verbose\n", prog);
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+int main(int argc, char *argv[]) {
+    char config_path[256] = "ransomguard_config.yaml";
+    int  extra_pid = -1;
+
+    // --- Parsing argomenti ---
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "--config") == 0 && i+1 < argc) {
+            strncpy(config_path, argv[++i], sizeof(config_path)-1);
+        } else if (strcmp(argv[i], "--pid") == 0 && i+1 < argc) {
+            extra_pid = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            g_cfg.verbose = true;
+        }
+    }
+
+    // --- Configurazione ---
+    set_defaults(&g_cfg);
+    if (access(config_path, R_OK) == 0) {
+        if (!parse_yaml(config_path, &g_cfg)) {
+            fprintf(stderr, "Errore nel parsing della configurazione, uso valori di default.\n");
+        } else {
+            printf("[INFO ] Configurazione caricata da: %s\n", config_path);
+        }
+    } else {
+        printf("[INFO ] File config non trovato (%s), uso valori di default.\n", config_path);
+    }
+
+    // Aggiungi PID extra alla whitelist
+    if (extra_pid > 0 && g_cfg.whitelist_pid_count < MAX_PIDS) {
+        g_cfg.whitelist_pid[g_cfg.whitelist_pid_count++] = (unsigned int)extra_pid;
+    }
+
+    // --- Apri log file ---
+    g_logfile = fopen(g_cfg.log_file, "a");
+    if (!g_logfile) {
+        fprintf(stderr, "Attenzione: impossibile aprire il log file %s\n", g_cfg.log_file);
+    }
+
+    LOG_INFO("RansomGuard avviato. PID=%d", getpid());
+    LOG_INFO("Soglie: open=%u write=%u rename=%u unlink=%u score=%u window=%us kill=%s",
+             g_cfg.thr_open, g_cfg.thr_write, g_cfg.thr_rename,
+             g_cfg.thr_unlink, g_cfg.thr_score, g_cfg.window_sec,
+             g_cfg.kill_on_detect ? "SI" : "NO");
+
+    // --- Setup eBPF ---
+    bump_memlock_rlimit();
+
+    // Apri, carica e attach il programma BPF
+    struct ransomguard *skel = ransomguard__open();
+    if (!skel) {
+        fprintf(stderr, "Errore ransomguard__open(): %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
+    g_skel = skel;
+
+    if (ransomguard__load(skel) != 0) {
+        fprintf(stderr, "Errore ransomguard__load(): %s\n", strerror(errno));
+        ransomguard__destroy(skel);
+        return EXIT_FAILURE;
+    }
+
+    if (ransomguard__attach(skel) != 0) {
+        fprintf(stderr, "Errore ransomguard__attach(): %s\n", strerror(errno));
+        ransomguard__destroy(skel);
+        return EXIT_FAILURE;
+    }
+
+    LOG_INFO("Programma eBPF caricato e agganciato ai tracepoint.");
+
+    // Carica la configurazione e la whitelist nelle BPF maps
+    push_config_to_bpf(skel, &g_cfg);
+    push_whitelist_to_bpf(skel, &g_cfg);
+
+    // --- Crea il ring buffer consumer ---
+    struct ring_buffer *rb = ring_buffer__new(
+        bpf_map__fd(skel->maps.events_ringbuf),
+        handle_event,
+        NULL,
+        NULL
+    );
+    if (!rb) {
+        fprintf(stderr, "Errore ring_buffer__new(): %s\n", strerror(errno));
+        ransomguard__destroy(skel);
+        return EXIT_FAILURE;
+    }
+
+    // --- Gestione segnali ---
+    signal(SIGINT,  sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    LOG_INFO("Monitoraggio attivo. Premi Ctrl+C per terminare.");
+    LOG_INFO("Syscall monitorate: open, write, rename, unlink, getrandom,");
+    LOG_INFO("  socket(AF_ALG), sendmsg, copy_file_range, vmsplice");
+
+    // --- Loop principale ---
+    time_t last_dump = time(NULL);
+    while (g_running) {
+        int err = ring_buffer__poll(rb, 100 /* ms timeout */);
+        if (err < 0 && errno != EINTR) {
+            LOG_WARN("ring_buffer__poll errore: %s", strerror(errno));
+            break;
+        }
+
+        // Dump periodico ogni 30 secondi
+        time_t now = time(NULL);
+        if (now - last_dump >= 30) {
+            dump_stats(skel);
+            last_dump = now;
+        }
+    }
+
+    // --- Cleanup ---
+    LOG_INFO("RansomGuard in chiusura...");
+    dump_stats(skel);  // dump finale
+    ring_buffer__free(rb);
+    ransomguard__destroy(skel);
+    if (g_logfile) fclose(g_logfile);
+
+    LOG_INFO("RansomGuard terminato.");
+    return 0;
+}

@@ -1,0 +1,123 @@
+# =============================================================================
+# RansomGuard - File di Configurazione
+# =============================================================================
+# Ogni parametro può essere modificato senza ricompilare il programma.
+# Il programma legge questo file all'avvio.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# SOGLIE DI RILEVAMENTO (thresholds)
+# Queste soglie definiscono quante chiamate sono accettabili nella finestra
+# temporale definita da window_seconds prima di alzare il punteggio.
+# -----------------------------------------------------------------------------
+thresholds:
+
+  # Numero massimo di open() accettabili nella finestra temporale
+  # Un ransomware che cifra 1000 file ne aprirà almeno 2000 (lettura + scrittura)
+  open_per_window: 200
+
+  # Numero massimo di write() accettabili nella finestra temporale
+  write_per_window: 200
+
+  # Numero massimo di rename() accettabili nella finestra temporale
+  # ATTENZIONE: anche 5-10 rename rapidi su file utente sono MOLTO sospetti
+  rename_per_window: 10
+
+  # Numero massimo di unlink() (cancellazioni) accettabili nella finestra temporale
+  # Cancellare 20+ file in 10 secondi è un segnale forte di ransomware
+  unlink_per_window: 20
+
+  # Punteggio massimo (su 100) oltre il quale scatta l'allarme.
+  # 60 = bilanciamento tra falsi positivi e rilevamento rapido
+  # 40 = più aggressivo (meno falsi negativi, più falsi positivi)
+  # 80 = conservativo (solo casi evidenti)
+  score_alert: 60
+
+  # Durata della finestra temporale in secondi.
+  # I contatori vengono azzerati ogni N secondi per ogni processo.
+  # Finestre più corte = rilevamento più rapido ma più sensibile ai picchi legittimi
+  window_seconds: 10
+
+
+# -----------------------------------------------------------------------------
+# SISTEMA DI SCORING
+# (informativo - i pesi sono nel codice BPF in update_score())
+#
+# Contributi al punteggio per evento:
+#   unlink (singolo)         +3  (distruzione file = molto sospetto)
+#   rename (singolo)         +2  (rinominare .jpg -> .enc = sospetto)
+#   write (>5 totali)        +1  per ogni write in eccesso
+#   socket(AF_ALG) (singolo) +10 (uso Crypto API del kernel = fortemente sospetto)
+#   getrandom (>2 totali)    +5  per chiamata (generazione chiavi)
+#   sendmsg verso AF_ALG     +3  (invio dati da cifrare)
+#   copy_file_range          +4  per chiamata (zero-copy sospetto)
+#   vmsplice                 +4  per chiamata (zero-copy sospetto)
+#
+# In più, il superamento delle soglie sopra aggiunge:
+#   open > thr_open          +5  (burst di aperture)
+#   write > thr_write        +5  (burst di scritture)
+#   rename > thr_rename      +15 (burst di rinominazioni = MOLTO sospetto)
+#   unlink > thr_unlink      +20 (burst di cancellazioni = CRITICO)
+# -----------------------------------------------------------------------------
+
+
+# -----------------------------------------------------------------------------
+# AZIONI
+# -----------------------------------------------------------------------------
+actions:
+
+  # Se true: il kernel BPF invia SIGKILL al processo tramite bpf_send_signal(9)
+  # nel momento esatto in cui supera la soglia score_alert.
+  # ATTENZIONE: può causare perdita di dati se il processo è legittimo!
+  # Raccomandato: inizia con false, monitora i log, poi abilita quando sei sicuro.
+  kill_on_detect: false
+
+  # File dove vengono scritti tutti gli alert e le statistiche
+  log_file: ransomguard.log
+
+  # Se true: logga ogni singolo evento ricevuto (molto verboso, solo per debug)
+  verbose: false
+
+
+# -----------------------------------------------------------------------------
+# WHITELIST PROCESSI
+# I processi in questa lista NON vengono monitorati dal BPF.
+# Usa i nomi esatti come appaiono in /proc/<pid>/comm (max 15 caratteri).
+# -----------------------------------------------------------------------------
+whitelist_processes:
+
+  # Esempio: aggiungi qui processi fidati che fanno molte operazioni sui file
+  # - rsync
+  # - tar
+  # - find
+  # - updatedb
+
+
+# -----------------------------------------------------------------------------
+# NOTE SUL FUNZIONAMENTO
+# =============================================================================
+#
+# COME FUNZIONA IL RILEVAMENTO:
+#
+# 1. Il programma eBPF si aggancia ai tracepoint delle syscall monitorate.
+#    Per ogni chiamata di un processo non in whitelist:
+#    - Incrementa i contatori nella mappa proc_stats_map (per PID)
+#    - Ricalcola lo score di pericolosità
+#    - Se score >= score_alert E kill_on_detect=true: invia SIGKILL
+#    - Invia un evento al ring buffer per notificare lo user-space
+#
+# 2. Il programma user-space (ransomguard) legge gli eventi dal ring buffer.
+#    Per ogni evento con score alto:
+#    - Logga l'alert con dettaglio completo
+#    - Se kill_on_detect=false: invia SIGSTOP al processo (blocco non distruttivo)
+#
+# VULNERABILITÀ RANSOMWARE COPERTE:
+#   - getrandom()         : generazione chiavi crittografiche
+#   - socket(AF_ALG)      : uso della Crypto API del kernel Linux
+#   - sendmsg/write       : invio dati al socket AF_ALG per cifratura
+#   - copy_file_range     : spostamento zero-copy di dati
+#   - vmsplice            : spostamento zero-copy pipe<->memoria
+#   - open/write/rename   : pattern cifratura file (apri, cifra, rinomina)
+#   - unlink              : cancellazione file originali dopo cifratura
+#
+# =============================================================================
